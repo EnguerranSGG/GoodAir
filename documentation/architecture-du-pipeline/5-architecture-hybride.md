@@ -18,7 +18,7 @@ Par soucis de portabilité, nous allons ici proposer une architecture dites 'hyb
 
 | Type de composant                                | Stratégie                                                                             |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------- |
-| Stockage et calcul (ADLS, Databricks, Synapse)   | Lock-in accepté — valeur ajoutée élevée, migration coûteuse mais rare                 |
+| Stockage (ADLS Gen2)                             | Lock-in accepté — valeur élevée, Delta Lake portable si migration nécessaire           |
 | Composants transversaux (monitoring, CI/CD, IaC) | Lock-in refusé — ces composants conditionnent l'opérabilité et la portabilité globale |
 | Rollback des données (Delta Lake)                | Déjà open source — aucun changement nécessaire                                        |
 
@@ -34,25 +34,25 @@ Azure Data Factory
           ↓
 Azure Functions (Python)
 (extraction, validation, écriture Bronze)
+(transformation Bronze → Silver — parsing JSON, nettoyage, normalisation)
           ↓
 Azure Data Lake Storage Gen2
 ├── /reference/   (référentiel des stations)
 ├── /bronze/      (JSON bruts)
-├── /silver/      (Delta Lake — nettoyé)
-└── /gold/        (Delta Lake — analytique)
+└── /silver/      (Parquet — nettoyé et normalisé)
           ↓
-Azure Databricks + Delta Lake
-(transformations Bronze→Silver→Gold)
+dbt Core sur Azure Container Apps
+(transformation Silver → Gold — modèle en étoile, agrégations analytiques)
           ↓
-Azure Synapse Analytics — Serverless SQL    ← requêtes analytiques structurées (Gold)
-Azure Cognitive Search                      ← recherche élastique semi-structurée (Bronze)
+Azure Database for PostgreSQL — Flexible Server   ← serving Gold (open source)
+Azure Cognitive Search                             ← recherche élastique (Bronze)
           ↓
 Power BI
 (dashboards, rapports métier)
 
 ─────────────────────────────────────────────────
 Grafana + OpenTelemetry    (monitoring transversal — portable)
-GitHub Actions             (CI/CD — portable)
+GitHub Actions             (CI/CD — portable, stop/start PostgreSQL)
 Terraform                  (IaC — multi-cloud)
 Azure Key Vault            (secrets — conservé)
 Microsoft Entra ID         (identités, RBAC — conservé)
@@ -81,9 +81,9 @@ Azure Monitor et Log Analytics sont des services entièrement propriétaires. Le
 ### Ce qui est instrumenté
 
 - pipelines ADF (via connecteur Azure Monitor → Grafana) ;
-- jobs Databricks (via OpenTelemetry SDK Python) ;
-- Azure Functions (via OpenTelemetry SDK Python) ;
-- Synapse Serverless SQL (via connecteur Azure Monitor → Grafana).
+- Azure Functions Python — extraction et transformation (via OpenTelemetry SDK Python) ;
+- Azure Container Apps — jobs dbt Core (via OpenTelemetry SDK Python) ;
+- Azure Database for PostgreSQL (via connecteur PostgreSQL → Grafana).
 
 ### Déploiement
 
@@ -138,11 +138,12 @@ Cette approche permettra de standardiser les mises en production, réduire les e
 
 #### Dans une future itération
 
-| Pipeline                | Déclencheur     | Actions                                      |
-| ----------------------- | --------------- | -------------------------------------------- |
-| `deploy-adf.yml`        | Push sur `main` | Publication des pipelines ADF via ARM export |
-| `deploy-functions.yml`  | Push sur `main` | Build et déploiement des Azure Functions     |
-| `deploy-databricks.yml` | Push sur `main` | Déploiement des notebooks et jobs Databricks |
+| Pipeline               | Déclencheur          | Actions                                             |
+| ---------------------- | -------------------- | --------------------------------------------------- |
+| `deploy-adf.yml`       | Push sur `main`      | Publication des pipelines ADF via ARM export        |
+| `deploy-functions.yml` | Push sur `main`      | Build et déploiement des Azure Functions            |
+| `deploy-dbt.yml`       | Push sur `main`      | Build et déploiement du container dbt sur Container Apps |
+| `postgres-schedule.yml`| Cron (20h / 7h)      | Stop/start automatique Azure Database for PostgreSQL |
 
 # 3. IaC et rollback infrastructure — Terraform
 
@@ -162,59 +163,66 @@ ARM et Bicep sont des langages de templating Azure-only. Ils ne sont pas réutil
 ### Ressources gérées par Terraform
 
 - compte ADLS Gen2 et containers ;
-- workspace Azure Databricks ;
-- workspace Azure Synapse Analytics ;
 - Azure Data Factory ;
 - Azure Functions (plan et application) ;
+- Azure Container Apps (dbt Core, Grafana) ;
+- Azure Database for PostgreSQL Flexible Server ;
 - Azure Cognitive Search (service et index) ;
 - Azure Key Vault et politiques d'accès ;
-- règles de réseau (Private endpoints, VNet) ;
-- instance Grafana sur Azure Container Apps.
+- règles de réseau (Private endpoints, VNet).
 
-## Rollback des données — Delta Lake (inchangé)
+## Rollback des données — Parquet versionné + sauvegardes PostgreSQL
 
-Le rollback des données repose sur le **time travel Delta Lake**, qui est un standard open source Apache. Il n'est pas lié à Azure et fonctionnerait de la même manière sur AWS ou GCP. Aucun changement n'est nécessaire sur ce point.
+Avec la suppression de Databricks, la couche Silver est stockée en format Parquet dans ADLS Gen2. Le rollback des données repose sur deux mécanismes :
 
-```sql
--- Lecture d'une version antérieure d'une table Delta
-SELECT * FROM silver.air_quality VERSION AS OF 42;
+**Couche Silver (ADLS Gen2 — Parquet) :** les fichiers Parquet sont organisés par partition temporelle (`/silver/air_quality/year=2026/month=05/...`). En cas d'erreur de transformation, il suffit de rejouer la Azure Function sur les fichiers Bronze correspondants. Aucune donnée n'est écrasée ; les partitions corrompues sont simplement remplacées.
 
--- Restauration
-RESTORE TABLE silver.air_quality TO VERSION AS OF 42;
+**Couche Gold (PostgreSQL) :** Azure Database for PostgreSQL Flexible Server inclut des **sauvegardes automatiques** (rétention 7 jours par défaut, PITR — Point-in-Time Recovery). En cas de problème sur la couche Gold, la base peut être restaurée à n'importe quel point dans les 7 derniers jours.
+
+```bash
+# Restauration PITR via Azure CLI
+az postgres flexible-server restore \
+  --resource-group goodair-rg \
+  --name goodair-postgres-restored \
+  --source-server goodair-postgres \
+  --restore-time "2026-05-03T14:00:00Z"
 ```
+
+dbt Core ajoute une couche de traçabilité supplémentaire : chaque run est loggé, et les modèles peuvent être rejoués intégralement à partir de la couche Silver.
 
 # 4. Ce qui est conservé d'Azure et pourquoi
 
-| Service Azure conservé       | Justification                                                                              |
-| ---------------------------- | ------------------------------------------------------------------------------------------ |
-| ADLS Gen2                    | Lock-in acceptable — valeur élevée, Delta Lake portable si migration nécessaire            |
-| Azure Databricks             | Multi-cloud natif (Azure, AWS, GCP) — lock-in limité                                       |
-| Azure Synapse Serverless SQL | Serving analytique structuré, remplaçable par Databricks SQL ou Athena en cas de migration |
-| Azure Cognitive Search       | Moteur de recherche élastique requis par la grille MSPR — remplaçable par Elasticsearch    |
-| Azure Data Factory           | Orchestration managée — remplaçable par Airflow si migration, coût de portage maîtrisé     |
-| Azure Functions              | Facilement remplaçable par AWS Lambda ou Cloud Functions — logique Python standard         |
-| Azure Key Vault              | Conservé pour les secrets — remplaçable par HashiCorp Vault si nécessaire                  |
-| Microsoft Entra ID           | Conservé pour le RBAC — standard entreprise, remplaçable par Okta ou Keycloak              |
+| Service Azure conservé                        | Justification                                                                           |
+| --------------------------------------------- | --------------------------------------------------------------------------------------- |
+| ADLS Gen2                                     | Lock-in acceptable — valeur élevée, format Parquet portable si migration nécessaire     |
+| Azure Data Factory                            | Orchestration managée — remplaçable par Airflow si migration, coût de portage maîtrisé |
+| Azure Functions                               | Facilement remplaçable par AWS Lambda ou Cloud Functions — logique Python standard      |
+| Azure Container Apps (dbt Core)               | Environnement d'exécution standard — dbt Core fonctionne sur n'importe quelle infra     |
+| Azure Database for PostgreSQL Flexible Server | Open source — portable sur AWS RDS, GCP Cloud SQL, ou on-premise sans modification     |
+| Azure Cognitive Search                        | Moteur de recherche élastique requis par la grille MSPR — remplaçable par Elasticsearch |
+| Azure Key Vault                               | Conservé pour les secrets — remplaçable par HashiCorp Vault si nécessaire               |
+| Microsoft Entra ID                            | Conservé pour le RBAC — standard entreprise, remplaçable par Okta ou Keycloak           |
 
 # Synthèse des changements
 
-| Composant        | Architecture initiale         | Architecture hybride    | Gain                                      |
-| ---------------- | ----------------------------- | ----------------------- | ----------------------------------------- |
-| Monitoring       | Azure Monitor + Log Analytics | Grafana + OpenTelemetry | Portabilité totale, dashboards versionnés |
-| CI/CD            | Azure DevOps (implicite)      | GitHub Actions          | Portabilité, standard de marché           |
-| IaC              | ARM / Bicep                   | Terraform               | Multi-cloud, rollback infrastructure      |
-| Rollback données | Delta Lake (déjà open source) | Inchangé                | —                                         |
-| Stockage         | ADLS Gen2                     | Inchangé                | Lock-in accepté et justifié               |
-| Calcul           | Azure Databricks              | Inchangé                | Multi-cloud natif                         |
-| Serving          | Synapse Serverless SQL        | Inchangé                | Lock-in limité et justifié                |
-| Data viz         | Power BI                      | Inchangé                | Lock-in accepté                           |
+| Composant        | Architecture initiale         | Architecture hybride                            | Gain                                          |
+| ---------------- | ----------------------------- | ----------------------------------------------- | --------------------------------------------- |
+| Monitoring       | Azure Monitor + Log Analytics | Grafana + OpenTelemetry                         | Portabilité totale, dashboards versionnés      |
+| CI/CD            | Azure DevOps (implicite)      | GitHub Actions                                  | Portabilité, standard de marché               |
+| IaC              | ARM / Bicep                   | Terraform                                       | Multi-cloud, rollback infrastructure          |
+| Rollback données | Delta Lake time travel        | Parquet versionné + PostgreSQL PITR             | Open source, sans dépendance Spark            |
+| Stockage         | ADLS Gen2                     | Inchangé                                        | Lock-in accepté et justifié                   |
+| Calcul ETL       | Azure Databricks (Spark)      | Azure Functions Python + dbt Core sur Container Apps | Suppression du lock-in Spark, coût réduit |
+| Serving Gold     | Azure Synapse Serverless SQL  | Azure Database for PostgreSQL Flexible Server   | Open source, portable, connecteur dbt natif   |
+| Data viz         | Power BI                      | Inchangé                                        | Lock-in accepté                               |
 
 # Risques résiduels
 
 Malgré ces ajustements, des dépendances résiduelles subsistent :
 
-- **ADLS Gen2** reste Azure-specific pour le stockage. Une migration vers S3 ou GCS nécessiterait un travail de reconfiguration (chemins, credentials, connecteurs Databricks).
-- **Power BI** reste propriétaire Microsoft. Une alternative open source serait Apache Superset, déjà évalué dans le benchmark.
-- **Azure Data Factory** reste propriétaire pour l'orchestration. Apache Airflow (déployé via Terraform sur AKS) constituerait l'alternative la plus portable.
+- **ADLS Gen2** reste Azure-specific pour le stockage. Une migration vers S3 ou GCS nécessiterait une reconfiguration des chemins et credentials, mais le format Parquet est nativement portable.
+- **Power BI** reste propriétaire Microsoft. Une alternative open source serait Apache Superset, déjà évalué dans le benchmark initial.
+- **Azure Data Factory** reste propriétaire pour l'orchestration. Apache Airflow (déployé via Terraform sur Azure Container Apps ou AKS) constituerait l'alternative la plus portable.
+- **Azure Cognitive Search** reste un service managé Azure. Elasticsearch auto-hébergé sur Azure Container Apps constituerait une alternative portable si la migration devenait nécessaire.
 
 Ces risques sont connus et documentés. Ils sont considérés acceptables dans le cadre du MVP, avec un chemin de migration identifié pour chaque composant.
